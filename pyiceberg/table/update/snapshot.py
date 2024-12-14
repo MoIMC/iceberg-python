@@ -26,6 +26,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING, Callable, Dict, Generic, List, Optional, Set, Tuple
 
 from sortedcontainers import SortedList
+from tenacity import RetryCallState
 
 from pyiceberg.expressions import (
     AlwaysFalse,
@@ -278,6 +279,13 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             (AssertRefSnapshotId(snapshot_id=self._transaction.table_metadata.current_snapshot_id, ref="main"),),
         )
 
+    def _cleanup_commit_failure(self, _state: RetryCallState) -> None:
+        self._transaction._table = self._transaction._table.catalog.load_table(self._transaction._table.name())
+        self._snapshot_id = self._transaction.table_metadata.new_snapshot_id()
+        self._parent_snapshot_id = (
+            snapshot.snapshot_id if (snapshot := self._transaction.table_metadata.current_snapshot()) else None
+        )
+
     @property
     def snapshot_id(self) -> int:
         return self._snapshot_id
@@ -436,6 +444,11 @@ class _DeleteFiles(_SnapshotProducer["_DeleteFiles"]):
 
     def _deleted_entries(self) -> List[ManifestEntry]:
         return self._compute_deletes[1]
+
+    def _cleanup_commit_failure(self, _state: RetryCallState) -> None:
+        super()._cleanup_commit_failure(_state)
+        del self.partition_filters
+        del self._compute_deletes
 
     @property
     def rewrites_needed(self) -> bool:
