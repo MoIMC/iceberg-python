@@ -26,6 +26,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING, Callable, Dict, Generic, List, Optional, Set, Tuple
 
 from sortedcontainers import SortedList
+from tenacity import RetryCallState
 
 from pyiceberg.expressions import (
     AlwaysFalse,
@@ -37,6 +38,7 @@ from pyiceberg.expressions.visitors import (
     ROWS_MUST_MATCH,
     _InclusiveMetricsEvaluator,
     _StrictMetricsEvaluator,
+    bind,
     inclusive_projection,
     manifest_evaluator,
 )
@@ -278,6 +280,13 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             (AssertRefSnapshotId(snapshot_id=self._transaction.table_metadata.current_snapshot_id, ref="main"),),
         )
 
+    def _cleanup_commit_failure(self, commit_uuid: uuid.UUID | None = None) -> None:
+        super()._cleanup_commit_failure()
+        self._manifest_num_counter = itertools.count(0)
+        self.commit_uuid = commit_uuid or uuid.uuid4()
+        self._snapshot_id = self._transaction.table_metadata.new_snapshot_id()
+        self._parent_snapshot_id = self._transaction.table_metadata.current_snapshot_id
+
     @property
     def snapshot_id(self) -> int:
         return self._snapshot_id
@@ -378,7 +387,7 @@ class _DeleteFiles(_SnapshotProducer["_DeleteFiles"]):
         manifest_evaluators: Dict[int, Callable[[ManifestFile], bool]] = KeyDefaultDict(self._build_manifest_evaluator)
         strict_metrics_evaluator = _StrictMetricsEvaluator(schema, self._predicate, case_sensitive=self._case_sensitive).eval
         inclusive_metrics_evaluator = _InclusiveMetricsEvaluator(
-            schema, self._predicate, case_sensitive=self._case_sensitive
+            schema, bind(self._transaction.table_metadata.schema(), self._predicate, case_sensitive=self._case_sensitive)
         ).eval
 
         existing_manifests = []
@@ -433,6 +442,11 @@ class _DeleteFiles(_SnapshotProducer["_DeleteFiles"]):
 
     def _deleted_entries(self) -> List[ManifestEntry]:
         return self._compute_deletes[1]
+
+    def _cleanup_commit_failure(self) -> None:
+        super()._cleanup_commit_failure()
+        del self.partition_filters
+        del self._compute_deletes
 
     @property
     def rewrites_needed(self) -> bool:
@@ -607,24 +621,39 @@ class UpdateSnapshot:
     _io: FileIO
     _snapshot_properties: Dict[str, str]
 
-    def __init__(self, transaction: Transaction, io: FileIO, snapshot_properties: Dict[str, str] = EMPTY_DICT) -> None:
+    def __init__(
+        self,
+        transaction: Transaction,
+        io: FileIO,
+        snapshot_properties: Dict[str, str] = EMPTY_DICT,
+        commit_uuid: uuid.UUID | None = None,
+    ) -> None:
         self._transaction = transaction
         self._io = io
         self._snapshot_properties = snapshot_properties
+        self._commit_uuid = commit_uuid
 
     def fast_append(self) -> _FastAppendFiles:
         return _FastAppendFiles(
-            operation=Operation.APPEND, transaction=self._transaction, io=self._io, snapshot_properties=self._snapshot_properties
+            operation=Operation.APPEND,
+            transaction=self._transaction,
+            io=self._io,
+            snapshot_properties=self._snapshot_properties,
+            commit_uuid=self._commit_uuid,
         )
 
     def merge_append(self) -> _MergeAppendFiles:
         return _MergeAppendFiles(
-            operation=Operation.APPEND, transaction=self._transaction, io=self._io, snapshot_properties=self._snapshot_properties
+            operation=Operation.APPEND,
+            transaction=self._transaction,
+            io=self._io,
+            snapshot_properties=self._snapshot_properties,
+            commit_uuid=self._commit_uuid,
         )
 
     def overwrite(self, commit_uuid: Optional[uuid.UUID] = None) -> _OverwriteFiles:
         return _OverwriteFiles(
-            commit_uuid=commit_uuid,
+            commit_uuid=commit_uuid or self._commit_uuid,
             operation=Operation.OVERWRITE
             if self._transaction.table_metadata.current_snapshot() is not None
             else Operation.APPEND,
@@ -639,6 +668,7 @@ class UpdateSnapshot:
             transaction=self._transaction,
             io=self._io,
             snapshot_properties=self._snapshot_properties,
+            commit_uuid=self._commit_uuid,
         )
 
 

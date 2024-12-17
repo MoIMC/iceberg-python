@@ -52,7 +52,7 @@ from hive_metastore.ttypes import (
 )
 from hive_metastore.ttypes import Database as HiveDatabase
 from hive_metastore.ttypes import Table as HiveTable
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 from thrift.protocol import TBinaryProtocol
 from thrift.transport import TSocket, TTransport
 
@@ -112,7 +112,7 @@ from pyiceberg.types import (
     TimeType,
     UUIDType,
 )
-from pyiceberg.utils.properties import property_as_bool, property_as_float
+from pyiceberg.utils.properties import property_as_bool, property_as_float, property_as_int
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -286,7 +286,7 @@ class HiveCatalog(MetastoreCatalog):
 
         self._lock_check_min_wait_time = property_as_float(properties, LOCK_CHECK_MIN_WAIT_TIME, DEFAULT_LOCK_CHECK_MIN_WAIT_TIME)
         self._lock_check_max_wait_time = property_as_float(properties, LOCK_CHECK_MAX_WAIT_TIME, DEFAULT_LOCK_CHECK_MAX_WAIT_TIME)
-        self._lock_check_retries = property_as_float(
+        self._lock_check_retries = property_as_int(
             properties,
             LOCK_CHECK_RETRIES,
             DEFAULT_LOCK_CHECK_RETRIES,
@@ -462,18 +462,24 @@ class HiveCatalog(MetastoreCatalog):
         return lock_request
 
     def _wait_for_lock(self, database_name: str, table_name: str, lockid: int, open_client: Client) -> LockResponse:
+        def _on_wait_for_lock_fail(state: RetryCallState) -> None:
+            raise WaitingForLockException(
+                f"Failed after {state.attempt_number} attempts to wait on lock for {database_name}.{table_name}"
+            )
+
         @retry(
             retry=retry_if_exception_type(WaitingForLockException),
             wait=wait_exponential(multiplier=2, min=self._lock_check_min_wait_time, max=self._lock_check_max_wait_time),
             stop=stop_after_attempt(self._lock_check_retries),
-            reraise=True,
+            before=lambda state: logger.warning(f"({state.attempt_number}) Waiting on lock for {database_name}.{table_name}..."),
+            retry_error_callback=_on_wait_for_lock_fail,
         )
         def _do_wait_for_lock() -> LockResponse:
             response: LockResponse = open_client.check_lock(CheckLockRequest(lockid=lockid))
             if response.state == LockState.ACQUIRED:
                 return response
             elif response.state == LockState.WAITING:
-                msg = f"Wait on lock for {database_name}.{table_name}"
+                msg = f"Waiting on lock for {database_name}.{table_name}..."
                 logger.warning(msg)
                 raise WaitingForLockException(msg)
             else:

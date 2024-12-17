@@ -17,18 +17,30 @@
 from __future__ import annotations
 
 import itertools
+from logging import getLogger
 import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
-from functools import singledispatch
+from functools import singledispatch, wraps
 from typing import TYPE_CHECKING, Annotated, Any, Dict, Generic, List, Literal, Optional, Tuple, TypeVar, Union, cast
 
 from pydantic import Field, field_validator, model_validator
+from tenacity import RetryCallState, before_sleep_log, retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
 
 from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.partitioning import PARTITION_FIELD_ID_START, PartitionSpec
 from pyiceberg.schema import Schema
-from pyiceberg.table.metadata import SUPPORTED_TABLE_FORMAT_VERSION, TableMetadata, TableMetadataUtil
+from pyiceberg.table.metadata import (
+    COMMIT_MAX_RETRY_WAIT_MS,
+    COMMIT_MAX_RETRY_WAIT_MS_DEFAULT,
+    COMMIT_MIN_RETRY_WAIT_MS,
+    COMMIT_MIN_RETRY_WAIT_MS_DEFAULT,
+    COMMIT_NUM_RETRIES,
+    COMMIT_NUM_RETRIES_DEFAULT,
+    SUPPORTED_TABLE_FORMAT_VERSION,
+    TableMetadata,
+    TableMetadataUtil,
+)
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef
 from pyiceberg.table.snapshots import (
     MetadataLogEntry,
@@ -54,6 +66,9 @@ if TYPE_CHECKING:
 U = TypeVar("U")
 
 
+logger = getLogger(__name__)
+
+
 class UpdateTableMetadata(ABC, Generic[U]):
     _transaction: Transaction
 
@@ -64,7 +79,36 @@ class UpdateTableMetadata(ABC, Generic[U]):
     def _commit(self) -> UpdatesAndRequirements: ...
 
     def commit(self) -> None:
-        self._transaction._apply(*self._commit())
+        min_wait_ms = int(
+            self._transaction.table_metadata.properties.get(COMMIT_MIN_RETRY_WAIT_MS, COMMIT_MIN_RETRY_WAIT_MS_DEFAULT)
+        )
+        max_wait_ms = int(
+            self._transaction.table_metadata.properties.get(COMMIT_MAX_RETRY_WAIT_MS, COMMIT_MAX_RETRY_WAIT_MS_DEFAULT)
+        )
+        num_retries = int(self._transaction.table_metadata.properties.get(COMMIT_NUM_RETRIES, COMMIT_NUM_RETRIES_DEFAULT))
+
+        def _before_commit_inner(state: RetryCallState) -> None:
+            if state.attempt_number > 1:
+                self._cleanup_commit_failure()
+
+        @wraps(self.commit)
+        @retry(
+            wait=wait_random_exponential(min=min_wait_ms / 1000, max=max_wait_ms / 1000),
+            stop=stop_after_attempt(num_retries),
+            retry=retry_if_exception_type(CommitFailedException),
+            before=_before_commit_inner,
+            before_sleep=lambda state: logger.debug(
+                f"({state.attempt_number}) Retrying snapshot commit for {'.'.join(self._transaction._table.name())}..."
+            ),
+        )
+        def commit_inner() -> None:
+            self._transaction._apply(*self._commit())
+
+        return commit_inner()
+
+    def _cleanup_commit_failure(self) -> None:
+        """Prepare the snapshot producer to commit against the latest version of the table after it has been updated."""
+        pass
 
     def __exit__(self, _: Any, value: Any, traceback: Any) -> None:
         """Close and commit the change."""

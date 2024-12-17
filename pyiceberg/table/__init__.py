@@ -17,11 +17,12 @@
 from __future__ import annotations
 
 import itertools
+from logging import getLogger
 import uuid
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cached_property, wraps
 from itertools import chain
 from types import TracebackType
 from typing import (
@@ -41,8 +42,10 @@ from typing import (
 
 from pydantic import Field
 from sortedcontainers import SortedList
+from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
 
 import pyiceberg.expressions.parser as parser
+from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.expressions import (
     AlwaysFalse,
     AlwaysTrue,
@@ -60,6 +63,7 @@ from pyiceberg.expressions.visitors import (
     expression_evaluator,
     inclusive_projection,
     manifest_evaluator,
+    rewrite_not,
 )
 from pyiceberg.io import FileIO, load_file_io
 from pyiceberg.manifest import (
@@ -80,6 +84,12 @@ from pyiceberg.schema import Schema
 from pyiceberg.table.inspect import InspectTable
 from pyiceberg.table.locations import LocationProvider, load_location_provider
 from pyiceberg.table.metadata import (
+    COMMIT_MAX_RETRY_WAIT_MS,
+    COMMIT_MAX_RETRY_WAIT_MS_DEFAULT,
+    COMMIT_MIN_RETRY_WAIT_MS,
+    COMMIT_MIN_RETRY_WAIT_MS_DEFAULT,
+    COMMIT_NUM_RETRIES,
+    COMMIT_NUM_RETRIES_DEFAULT,
     INITIAL_SEQUENCE_NUMBER,
     TableMetadata,
 )
@@ -95,6 +105,7 @@ from pyiceberg.table.sorting import UNSORTED_SORT_ORDER, SortOrder
 from pyiceberg.table.update import (
     AddPartitionSpecUpdate,
     AddSchemaUpdate,
+    AddSnapshotUpdate,
     AddSortOrderUpdate,
     AssertCreate,
     AssertRefSnapshotId,
@@ -115,6 +126,7 @@ from pyiceberg.table.update import (
 )
 from pyiceberg.table.update.schema import UpdateSchema
 from pyiceberg.table.update.snapshot import (
+    _SnapshotProducer,
     ManageSnapshots,
     UpdateSnapshot,
     _FastAppendFiles,
@@ -241,12 +253,15 @@ class TableProperties:
     MIN_SNAPSHOTS_TO_KEEP_DEFAULT = 1
 
 
+logger = getLogger(__name__)
+
+
 class Transaction:
     _table: Table
-    table_metadata: TableMetadata
     _autocommit: bool
     _updates: Tuple[TableUpdate, ...]
     _requirements: Tuple[TableRequirement, ...]
+    _snapshot_operations: Tuple[_SnapshotProducer, ...]
 
     def __init__(self, table: Table, autocommit: bool = False):
         """Open a transaction to stage and commit changes to a table.
@@ -255,11 +270,15 @@ class Transaction:
             table: The table that will be altered.
             autocommit: Option to automatically commit the changes when they are staged.
         """
-        self.table_metadata = table.metadata
         self._table = table
         self._autocommit = autocommit
         self._updates = ()
         self._requirements = ()
+        self._snapshot_operations = ()
+
+    @property
+    def table_metadata(self) -> TableMetadata:
+        return self._table.metadata
 
     def __enter__(self) -> Transaction:
         """Start a transaction to update the table."""
@@ -286,7 +305,7 @@ class Transaction:
             if type(new_requirement) not in existing_requirements:
                 self._requirements = self._requirements + (new_requirement,)
 
-        self.table_metadata = update_table_metadata(self.table_metadata, updates)
+        self._table.metadata = update_table_metadata(self.table_metadata, updates)
 
         if self._autocommit:
             self.commit_transaction()
@@ -397,7 +416,9 @@ class Transaction:
             expr = Or(expr, match_partition_expression)
         return expr
 
-    def _append_snapshot_producer(self, snapshot_properties: Dict[str, str]) -> _FastAppendFiles:
+    def _append_snapshot_producer(
+        self, snapshot_properties: Dict[str, str], commit_uuid: uuid.UUID | None = None
+    ) -> _FastAppendFiles:
         """Determine the append type based on table properties.
 
         Args:
@@ -410,7 +431,7 @@ class Transaction:
             TableProperties.MANIFEST_MERGE_ENABLED,
             TableProperties.MANIFEST_MERGE_ENABLED_DEFAULT,
         )
-        update_snapshot = self.update_snapshot(snapshot_properties=snapshot_properties)
+        update_snapshot = self.update_snapshot(snapshot_properties=snapshot_properties, commit_uuid=commit_uuid)
         return update_snapshot.merge_append() if manifest_merge_enabled else update_snapshot.fast_append()
 
     def update_schema(self, allow_incompatible_changes: bool = False, case_sensitive: bool = True) -> UpdateSchema:
@@ -430,13 +451,15 @@ class Transaction:
             name_mapping=self.table_metadata.name_mapping(),
         )
 
-    def update_snapshot(self, snapshot_properties: Dict[str, str] = EMPTY_DICT) -> UpdateSnapshot:
+    def update_snapshot(
+        self, snapshot_properties: Dict[str, str] = EMPTY_DICT, commit_uuid: uuid.UUID | None = None
+    ) -> UpdateSnapshot:
         """Create a new UpdateSnapshot to produce a new snapshot for the table.
 
         Returns:
             A new UpdateSnapshot
         """
-        return UpdateSnapshot(self, io=self._table.io, snapshot_properties=snapshot_properties)
+        return UpdateSnapshot(self, io=self._table.io, snapshot_properties=snapshot_properties, commit_uuid=commit_uuid)
 
     def append(self, df: pa.Table, snapshot_properties: Dict[str, str] = EMPTY_DICT) -> None:
         """
@@ -467,16 +490,23 @@ class Transaction:
             self.table_metadata.schema(), provided_schema=df.schema, downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us
         )
 
-        with self._append_snapshot_producer(snapshot_properties) as append_files:
+        if not df.shape[0]:
+            warnings.warn("Attempted append with no records")
+            return
+
+        append_snapshot_commit_uuid = uuid.uuid4()
+        data_files = list(
+            _dataframe_to_data_files(
+                table_metadata=self.table_metadata, write_uuid=append_snapshot_commit_uuid, df=df, io=self._table.io
+            )
+        )
+        with self._append_snapshot_producer(snapshot_properties, commit_uuid=append_snapshot_commit_uuid) as append_files:
             # skip writing data files if the dataframe is empty
             if df.shape[0] > 0:
-                data_files = list(
-                    _dataframe_to_data_files(
-                        table_metadata=self.table_metadata, write_uuid=append_files.commit_uuid, df=df, io=self._table.io
-                    )
-                )
                 for data_file in data_files:
                     append_files.append_data_file(data_file)
+
+        self._snapshot_operations += (append_files,)
 
     def dynamic_partition_overwrite(self, df: pa.Table, snapshot_properties: Dict[str, str] = EMPTY_DICT) -> None:
         """
@@ -529,10 +559,11 @@ class Transaction:
         delete_filter = self._build_partition_predicate(partition_records=partitions_to_overwrite)
         self.delete(delete_filter=delete_filter, snapshot_properties=snapshot_properties)
 
-        with self._append_snapshot_producer(snapshot_properties) as append_files:
-            append_files.commit_uuid = append_snapshot_commit_uuid
+        with self._append_snapshot_producer(snapshot_properties, commit_uuid=append_snapshot_commit_uuid) as append_files:
             for data_file in data_files:
                 append_files.append_data_file(data_file)
+
+        self._snapshot_operations += (append_files,)
 
     def overwrite(
         self,
@@ -590,6 +621,8 @@ class Transaction:
                 )
                 for data_file in data_files:
                     append_files.append_data_file(data_file)
+
+        self._snapshot_operations += (append_files,)
 
     def delete(
         self,
@@ -685,6 +718,8 @@ class Transaction:
         if not delete_snapshot.files_affected and not delete_snapshot.rewrites_needed:
             warnings.warn("Delete operation did not match any records")
 
+        self._snapshot_operations += (delete_snapshot,)
+
     def add_files(
         self, file_paths: List[str], snapshot_properties: Dict[str, str] = EMPTY_DICT, check_duplicate_files: bool = True
     ) -> None:
@@ -715,12 +750,13 @@ class Transaction:
             self.set_properties(
                 **{TableProperties.DEFAULT_NAME_MAPPING: self.table_metadata.schema().name_mapping.model_dump_json()}
             )
-        with self.update_snapshot(snapshot_properties=snapshot_properties).fast_append() as update_snapshot:
-            data_files = _parquet_files_to_data_files(
-                table_metadata=self.table_metadata, file_paths=file_paths, io=self._table.io
-            )
+
+        data_files = _parquet_files_to_data_files(table_metadata=self.table_metadata, file_paths=file_paths, io=self._table.io)
+        with self.update_snapshot(snapshot_properties=snapshot_properties).fast_append() as append_snapshot:
             for data_file in data_files:
-                update_snapshot.append_data_file(data_file)
+                append_snapshot.append_data_file(data_file)
+
+        self._snapshot_operations += (append_snapshot,)
 
     def update_spec(self) -> UpdateSpec:
         """Create a new UpdateSpec to update the partitioning of the table.
@@ -758,15 +794,46 @@ class Transaction:
         Returns:
             The table with the updates applied.
         """
-        if len(self._updates) > 0:
-            self._requirements += (AssertTableUUID(uuid=self.table_metadata.table_uuid),)
-            self._table._do_commit(  # pylint: disable=W0212
-                updates=self._updates,
-                requirements=self._requirements,
-            )
-            return self._table
-        else:
-            return self._table
+
+        min_wait_ms = int(self.table_metadata.properties.get(COMMIT_MIN_RETRY_WAIT_MS, COMMIT_MIN_RETRY_WAIT_MS_DEFAULT))
+        max_wait_ms = int(self.table_metadata.properties.get(COMMIT_MAX_RETRY_WAIT_MS, COMMIT_MAX_RETRY_WAIT_MS_DEFAULT))
+        num_retries = int(self.table_metadata.properties.get(COMMIT_NUM_RETRIES, COMMIT_NUM_RETRIES_DEFAULT))
+
+        def _before_attempt(state: RetryCallState):
+            if state.attempt_number > 1:
+                namespace, table = self._table.name()
+                logger.debug(f"Refreshing metadata and operations for {namespace}.{table} and retrying transaction commit...")
+                self._table.refresh()
+                self._updates, self._requirements = (), ()
+                for op in self._snapshot_operations:
+                    op._cleanup_commit_failure()
+                    self._apply(*op._commit())
+            logger.debug(f"Committing transaction...")
+
+        def _after_error(state: RetryCallState):
+            logger.debug(f'Encountered CommitFailedException: "{state.outcome.exception()}"...')
+
+        @wraps(self.commit_transaction)
+        @retry(
+            wait=wait_random_exponential(min=min_wait_ms / 1000, max=max_wait_ms / 1000),
+            stop=stop_after_attempt(num_retries),
+            retry=retry_if_exception_type(CommitFailedException),
+            before=_before_attempt,
+            after=_after_error,
+            reraise=True,
+        )
+        def _commit_transaction():
+            if len(self._updates) > 0:
+                self._requirements += (AssertTableUUID(uuid=self.table_metadata.table_uuid),)
+                self._table._do_commit(  # pylint: disable=W0212
+                    updates=self._updates,
+                    requirements=self._requirements,
+                )
+                return self._table
+            else:
+                return self._table
+
+        return _commit_transaction()
 
 
 class CreateTableTransaction(Transaction):
@@ -1310,16 +1377,6 @@ class Table:
 
     def _do_commit(self, updates: Tuple[TableUpdate, ...], requirements: Tuple[TableRequirement, ...]) -> None:
         response = self.catalog.commit_table(self, requirements, updates)
-
-        # https://github.com/apache/iceberg/blob/f6faa58/core/src/main/java/org/apache/iceberg/CatalogUtil.java#L527
-        # delete old metadata if METADATA_DELETE_AFTER_COMMIT_ENABLED is set to true and uses
-        # TableProperties.METADATA_PREVIOUS_VERSIONS_MAX to determine how many previous versions to keep -
-        # everything else will be removed.
-        try:
-            self.catalog._delete_old_metadata(self.io, self.metadata, response.metadata)
-        except Exception as e:
-            warnings.warn(f"Failed to delete old metadata after commit: {e}")
-
         self.metadata = response.metadata
         self.metadata_location = response.metadata_location
 
@@ -1433,6 +1490,7 @@ class TableScan(ABC):
     snapshot_id: Optional[int]
     options: Properties
     limit: Optional[int]
+    bound_filter: BooleanExpression
 
     def __init__(
         self,
@@ -1444,6 +1502,7 @@ class TableScan(ABC):
         snapshot_id: Optional[int] = None,
         options: Properties = EMPTY_DICT,
         limit: Optional[int] = None,
+        bound_filter: Optional[BooleanExpression] = None
     ):
         self.table_metadata = table_metadata
         self.io = io
@@ -1453,6 +1512,7 @@ class TableScan(ABC):
         self.snapshot_id = snapshot_id
         self.options = options
         self.limit = limit
+        self.bound_filter = bound_filter or bind(self.table_metadata.schema(), rewrite_not(self.row_filter), self.case_sensitive)
 
     def snapshot(self) -> Optional[Snapshot]:
         if self.snapshot_id:
@@ -1635,7 +1695,7 @@ class DataScan(TableScan):
         # shared instance across multiple threads.
         return lambda data_file: _InclusiveMetricsEvaluator(
             schema,
-            self.row_filter,
+            self.bound_filter,
             self.case_sensitive,
             include_empty_files,
         ).eval(data_file)
@@ -1653,7 +1713,7 @@ class DataScan(TableScan):
         return lambda datafile: (
             residual_evaluator_of(
                 spec=spec,
-                expr=self.row_filter,
+                expr=self.bound_filter,
                 case_sensitive=self.case_sensitive,
                 schema=self.table_metadata.schema(),
             )
@@ -1759,7 +1819,7 @@ class DataScan(TableScan):
         from pyiceberg.io.pyarrow import ArrowScan
 
         return ArrowScan(
-            self.table_metadata, self.io, self.projection(), self.row_filter, self.case_sensitive, self.limit
+            self.table_metadata, self.io, self.projection(), self.bound_filter, self.case_sensitive, self.limit
         ).to_table(self.plan_files())
 
     def to_arrow_batch_reader(self) -> pa.RecordBatchReader:
@@ -1779,7 +1839,7 @@ class DataScan(TableScan):
 
         target_schema = schema_to_pyarrow(self.projection())
         batches = ArrowScan(
-            self.table_metadata, self.io, self.projection(), self.row_filter, self.case_sensitive, self.limit
+            self.table_metadata, self.io, self.projection(), self.bound_filter, self.case_sensitive, self.limit
         ).to_record_batches(self.plan_files())
 
         return pa.RecordBatchReader.from_batches(
@@ -1852,7 +1912,7 @@ class DataScan(TableScan):
                     table_metadata=self.table_metadata,
                     io=self.io,
                     projected_schema=self.projection(),
-                    row_filter=self.row_filter,
+                    row_filter=self.bound_filter,
                     case_sensitive=self.case_sensitive,
                 )
                 tbl = arrow_scan.to_table([task])
