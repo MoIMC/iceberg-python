@@ -251,7 +251,7 @@ class BindVisitor(BooleanExpressionVisitor[BooleanExpression]):
         return predicate.bind(self.schema, case_sensitive=self.case_sensitive)
 
     def visit_bound_predicate(self, predicate: BoundPredicate[L]) -> BooleanExpression:
-        raise TypeError(f"Found already bound predicate: {predicate}")
+        return predicate
 
 
 class BoundBooleanExpressionVisitor(BooleanExpressionVisitor[T], ABC):

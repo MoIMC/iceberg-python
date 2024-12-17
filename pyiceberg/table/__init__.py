@@ -21,7 +21,7 @@ import uuid
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cached_property, wraps
 from itertools import chain
 from types import TracebackType
 from typing import (
@@ -41,8 +41,10 @@ from typing import (
 
 from pydantic import Field
 from sortedcontainers import SortedList
+from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
 
 import pyiceberg.expressions.parser as parser
+from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.expressions import (
     AlwaysFalse,
     AlwaysTrue,
@@ -60,6 +62,7 @@ from pyiceberg.expressions.visitors import (
     expression_evaluator,
     inclusive_projection,
     manifest_evaluator,
+    rewrite_not,
 )
 from pyiceberg.io import FileIO, load_file_io
 from pyiceberg.manifest import (
@@ -80,6 +83,12 @@ from pyiceberg.schema import Schema
 from pyiceberg.table.inspect import InspectTable
 from pyiceberg.table.locations import LocationProvider, load_location_provider
 from pyiceberg.table.metadata import (
+    COMMIT_MAX_RETRY_WAIT_MS,
+    COMMIT_MAX_RETRY_WAIT_MS_DEFAULT,
+    COMMIT_MIN_RETRY_WAIT_MS,
+    COMMIT_MIN_RETRY_WAIT_MS_DEFAULT,
+    COMMIT_NUM_RETRIES,
+    COMMIT_NUM_RETRIES_DEFAULT,
     INITIAL_SEQUENCE_NUMBER,
     TableMetadata,
 )
@@ -95,6 +104,7 @@ from pyiceberg.table.sorting import UNSORTED_SORT_ORDER, SortOrder
 from pyiceberg.table.update import (
     AddPartitionSpecUpdate,
     AddSchemaUpdate,
+    AddSnapshotUpdate,
     AddSortOrderUpdate,
     AssertCreate,
     AssertRefSnapshotId,
@@ -1309,19 +1319,51 @@ class Table:
         return self.metadata.refs
 
     def _do_commit(self, updates: Tuple[TableUpdate, ...], requirements: Tuple[TableRequirement, ...]) -> None:
-        response = self.catalog.commit_table(self, requirements, updates)
+        def _on_error(*_: RetryCallState) -> None:
+            nonlocal updates, requirements
+            self.refresh()
+            next_seq_num = self.metadata.next_sequence_number()
+            updates = tuple(
+                (
+                    update.model_copy(
+                        update={
+                            "snapshot": update.snapshot.model_copy(
+                                update={
+                                    "parent_snaphot_id": self.metadata.current_snapshot_id,
+                                    "sequence_number": next_seq_num,
+                                }
+                            ),
+                        },
+                    )
+                    if isinstance(update, AddSnapshotUpdate)
+                    else update
+                )
+                for update in updates
+            )
+            requirements = tuple(
+                req.model_copy(update={"snapshot_id": self.metadata.current_snapshot_id})
+                if isinstance(req, AssertRefSnapshotId)
+                else req
+                for req in requirements
+            )
 
-        # https://github.com/apache/iceberg/blob/f6faa58/core/src/main/java/org/apache/iceberg/CatalogUtil.java#L527
-        # delete old metadata if METADATA_DELETE_AFTER_COMMIT_ENABLED is set to true and uses
-        # TableProperties.METADATA_PREVIOUS_VERSIONS_MAX to determine how many previous versions to keep -
-        # everything else will be removed.
-        try:
-            self.catalog._delete_old_metadata(self.io, self.metadata, response.metadata)
-        except Exception as e:
-            warnings.warn(f"Failed to delete old metadata after commit: {e}")
+        min_wait_ms = int(self.metadata.properties.get(COMMIT_MIN_RETRY_WAIT_MS, COMMIT_MIN_RETRY_WAIT_MS_DEFAULT))
+        max_wait_ms = int(self.metadata.properties.get(COMMIT_MAX_RETRY_WAIT_MS, COMMIT_MAX_RETRY_WAIT_MS_DEFAULT))
+        num_retries = int(self.metadata.properties.get(COMMIT_NUM_RETRIES, COMMIT_NUM_RETRIES_DEFAULT))
 
-        self.metadata = response.metadata
-        self.metadata_location = response.metadata_location
+        @wraps(self._do_commit)
+        @retry(
+            wait=wait_random_exponential(min=min_wait_ms / 1000, max=max_wait_ms / 1000),
+            stop=stop_after_attempt(num_retries),
+            retry=retry_if_exception_type(CommitFailedException),
+            after=_on_error,
+        )
+        def _do_commit_inner() -> None:
+            response = self.catalog.commit_table(self, requirements, updates)
+            self.metadata = response.metadata
+            self.metadata_location = response.metadata_location
+
+        return _do_commit_inner()
 
     def __eq__(self, other: Any) -> bool:
         """Return the equality of two instances of the Table class."""
@@ -1433,6 +1475,7 @@ class TableScan(ABC):
     snapshot_id: Optional[int]
     options: Properties
     limit: Optional[int]
+    bound_filter: BooleanExpression
 
     def __init__(
         self,
@@ -1444,6 +1487,7 @@ class TableScan(ABC):
         snapshot_id: Optional[int] = None,
         options: Properties = EMPTY_DICT,
         limit: Optional[int] = None,
+        bound_filter: Optional[BooleanExpression] = None
     ):
         self.table_metadata = table_metadata
         self.io = io
@@ -1453,6 +1497,7 @@ class TableScan(ABC):
         self.snapshot_id = snapshot_id
         self.options = options
         self.limit = limit
+        self.bound_filter = bound_filter or bind(self.table_metadata.schema(), rewrite_not(self.row_filter), self.case_sensitive)
 
     def snapshot(self) -> Optional[Snapshot]:
         if self.snapshot_id:
@@ -1635,7 +1680,7 @@ class DataScan(TableScan):
         # shared instance across multiple threads.
         return lambda data_file: _InclusiveMetricsEvaluator(
             schema,
-            self.row_filter,
+            self.bound_filter,
             self.case_sensitive,
             include_empty_files,
         ).eval(data_file)
@@ -1653,7 +1698,7 @@ class DataScan(TableScan):
         return lambda datafile: (
             residual_evaluator_of(
                 spec=spec,
-                expr=self.row_filter,
+                expr=self.bound_filter,
                 case_sensitive=self.case_sensitive,
                 schema=self.table_metadata.schema(),
             )
@@ -1759,7 +1804,7 @@ class DataScan(TableScan):
         from pyiceberg.io.pyarrow import ArrowScan
 
         return ArrowScan(
-            self.table_metadata, self.io, self.projection(), self.row_filter, self.case_sensitive, self.limit
+            self.table_metadata, self.io, self.projection(), self.bound_filter, self.case_sensitive, self.limit
         ).to_table(self.plan_files())
 
     def to_arrow_batch_reader(self) -> pa.RecordBatchReader:
@@ -1779,7 +1824,7 @@ class DataScan(TableScan):
 
         target_schema = schema_to_pyarrow(self.projection())
         batches = ArrowScan(
-            self.table_metadata, self.io, self.projection(), self.row_filter, self.case_sensitive, self.limit
+            self.table_metadata, self.io, self.projection(), self.bound_filter, self.case_sensitive, self.limit
         ).to_record_batches(self.plan_files())
 
         return pa.RecordBatchReader.from_batches(
@@ -1852,7 +1897,7 @@ class DataScan(TableScan):
                     table_metadata=self.table_metadata,
                     io=self.io,
                     projected_schema=self.projection(),
-                    row_filter=self.row_filter,
+                    row_filter=self.bound_filter,
                     case_sensitive=self.case_sensitive,
                 )
                 tbl = arrow_scan.to_table([task])
