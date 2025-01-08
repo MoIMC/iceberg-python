@@ -94,8 +94,8 @@ class UpdateTableMetadata(ABC, Generic[U]):
 
         return commit_inner()
 
-    @abstractmethod
-    def _cleanup_commit_failure(self, _state: RetryCallState) -> None: ...
+    def _cleanup_commit_failure(self, state: RetryCallState) -> None:
+        self._transaction = self._transaction._table.catalog.load_table(self._transaction._table.name()).transaction()
 
     def __exit__(self, _: Any, value: Any, traceback: Any) -> None:
         """Close and commit the change."""

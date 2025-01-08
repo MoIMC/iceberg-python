@@ -280,7 +280,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         )
 
     def _cleanup_commit_failure(self, _state: RetryCallState) -> None:
-        self._transaction._table = self._transaction._table.catalog.load_table(self._transaction._table.name())
+        super()._cleanup_commit_failure(_state)
         self._snapshot_id = self._transaction.table_metadata.new_snapshot_id()
         self._parent_snapshot_id = (
             snapshot.snapshot_id if (snapshot := self._transaction.table_metadata.current_snapshot()) else None
