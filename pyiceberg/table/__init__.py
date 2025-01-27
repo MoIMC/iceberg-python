@@ -21,7 +21,7 @@ import uuid
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cached_property, wraps
 from itertools import chain
 from types import TracebackType
 from typing import (
@@ -41,7 +41,9 @@ from typing import (
 
 from pydantic import Field
 from sortedcontainers import SortedList
+from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
 
+from pyiceberg.exceptions import CommitFailedException
 import pyiceberg.expressions.parser as parser
 from pyiceberg.expressions import (
     AlwaysTrue,
@@ -74,6 +76,12 @@ from pyiceberg.partitioning import (
 from pyiceberg.schema import Schema
 from pyiceberg.table.inspect import InspectTable
 from pyiceberg.table.metadata import (
+    COMMIT_MAX_RETRY_WAIT_MS,
+    COMMIT_MAX_RETRY_WAIT_MS_DEFAULT,
+    COMMIT_MIN_RETRY_WAIT_MS,
+    COMMIT_MIN_RETRY_WAIT_MS_DEFAULT,
+    COMMIT_NUM_RETRIES,
+    COMMIT_NUM_RETRIES_DEFAULT,
     INITIAL_SEQUENCE_NUMBER,
     TableMetadata,
 )
@@ -89,6 +97,7 @@ from pyiceberg.table.sorting import UNSORTED_SORT_ORDER, SortOrder
 from pyiceberg.table.update import (
     AddPartitionSpecUpdate,
     AddSchemaUpdate,
+    AddSnapshotUpdate,
     AddSortOrderUpdate,
     AssertCreate,
     AssertRefSnapshotId,
@@ -1059,9 +1068,51 @@ class Table:
         return self.metadata.refs
 
     def _do_commit(self, updates: Tuple[TableUpdate, ...], requirements: Tuple[TableRequirement, ...]) -> None:
-        response = self.catalog.commit_table(self, requirements, updates)
-        self.metadata = response.metadata
-        self.metadata_location = response.metadata_location
+        def _on_error(*_):
+            nonlocal updates, requirements
+            self.refresh()
+            next_seq_num = self.metadata.next_sequence_number()
+            updates = tuple(
+                (
+                    update.model_copy(
+                        update={
+                            "snapshot": update.snapshot.model_copy(
+                                update={
+                                    "parent_snaphot_id": self.metadata.current_snapshot_id,
+                                    "sequence_number": next_seq_num,
+                                }
+                            ),
+                        },
+                    )
+                    if isinstance(update, AddSnapshotUpdate)
+                    else update
+                )
+                for update in updates
+            )
+            requirements = tuple(
+                req.model_copy(update={"snapshot_id": self.metadata.current_snapshot_id})
+                if isinstance(req, AssertRefSnapshotId)
+                else req
+                for req in requirements
+            )
+
+        min_wait_ms = int(self.metadata.properties.get(COMMIT_MIN_RETRY_WAIT_MS, COMMIT_MIN_RETRY_WAIT_MS_DEFAULT))
+        max_wait_ms = int(self.metadata.properties.get(COMMIT_MAX_RETRY_WAIT_MS, COMMIT_MAX_RETRY_WAIT_MS_DEFAULT))
+        num_retries = int(self.metadata.properties.get(COMMIT_NUM_RETRIES, COMMIT_NUM_RETRIES_DEFAULT))
+
+        @wraps(self._do_commit)
+        @retry(
+            wait=wait_random_exponential(min=min_wait_ms / 1000, max=max_wait_ms / 1000),
+            stop=stop_after_attempt(num_retries),
+            retry=retry_if_exception_type(CommitFailedException),
+            after=_on_error,
+        )
+        def _do_commit_inner() -> None:
+            response = self.catalog.commit_table(self, requirements, updates)
+            self.metadata = response.metadata
+            self.metadata_location = response.metadata_location
+
+        return _do_commit_inner()
 
     def __eq__(self, other: Any) -> bool:
         """Return the equality of two instances of the Table class."""

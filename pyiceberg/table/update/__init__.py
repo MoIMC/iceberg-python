@@ -74,20 +74,20 @@ class UpdateTableMetadata(ABC, Generic[U]):
     def _commit(self) -> UpdatesAndRequirements: ...
 
     def commit(self) -> None:
-        min_wait = int(
+        min_wait_ms = int(
             self._transaction.table_metadata.properties.get(COMMIT_MIN_RETRY_WAIT_MS, COMMIT_MIN_RETRY_WAIT_MS_DEFAULT)
         )
-        max_wait = int(
+        max_wait_ms = int(
             self._transaction.table_metadata.properties.get(COMMIT_MAX_RETRY_WAIT_MS, COMMIT_MAX_RETRY_WAIT_MS_DEFAULT)
         )
         num_retries = int(self._transaction.table_metadata.properties.get(COMMIT_NUM_RETRIES, COMMIT_NUM_RETRIES_DEFAULT))
 
         @wraps(self.commit)
         @retry(
-            wait=wait_random_exponential(min=min_wait, max=max_wait, exp_base=2),
+            wait=wait_random_exponential(min=min_wait_ms / 1000, max=max_wait_ms / 1000),
             stop=stop_after_attempt(num_retries),
             retry=retry_if_exception_type(CommitFailedException),
-            retry_error_callback=self._cleanup_commit_failure,
+            after=self._cleanup_commit_failure,
         )
         def commit_inner():
             self._transaction._apply(*self._commit())
@@ -95,7 +95,7 @@ class UpdateTableMetadata(ABC, Generic[U]):
         return commit_inner()
 
     def _cleanup_commit_failure(self, state: RetryCallState) -> None:
-        self._transaction = self._transaction._table.catalog.load_table(self._transaction._table.name()).transaction()
+        self._transaction._table.refresh()
 
     def __exit__(self, _: Any, value: Any, traceback: Any) -> None:
         """Close and commit the change."""
