@@ -22,10 +22,10 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from functools import singledispatch, wraps
 from typing import TYPE_CHECKING, Any, Dict, Generic, List, Literal, Optional, Tuple, TypeVar, Union, cast
+from typing_extensions import Annotated
 
 from pydantic import Field, field_validator, model_validator
 from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
-from typing_extensions import Annotated
 
 from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.partitioning import PARTITION_FIELD_ID_START, PartitionSpec
