@@ -41,7 +41,7 @@ from mypy_boto3_glue.type_defs import (
 )
 
 from pyiceberg.catalog import (
-    DEPRECATED_BOTOCORE_SESSION,
+    BOTOCORE_SESSION,
     EXTERNAL_TABLE,
     ICEBERG,
     LOCATION,
@@ -311,7 +311,7 @@ class GlueCatalog(MetastoreCatalog):
         session = boto3.Session(
             profile_name=properties.get(GLUE_PROFILE_NAME),
             region_name=get_first_property_value(properties, GLUE_REGION, AWS_REGION),
-            botocore_session=properties.get(DEPRECATED_BOTOCORE_SESSION),
+            botocore_session=properties.get(BOTOCORE_SESSION),
             aws_access_key_id=get_first_property_value(properties, GLUE_ACCESS_KEY_ID, AWS_ACCESS_KEY_ID),
             aws_secret_access_key=get_first_property_value(properties, GLUE_SECRET_ACCESS_KEY, AWS_SECRET_ACCESS_KEY),
             aws_session_token=get_first_property_value(properties, GLUE_SESSION_TOKEN, AWS_SESSION_TOKEN),
@@ -556,8 +556,7 @@ class GlueCatalog(MetastoreCatalog):
         Raises:
             NoSuchTableError: If a table with the name does not exist, or the identifier is invalid.
         """
-        identifier_tuple = self._identifier_to_tuple_without_catalog(identifier)
-        database_name, table_name = self.identifier_to_database_and_table(identifier_tuple, NoSuchTableError)
+        database_name, table_name = self.identifier_to_database_and_table(identifier, NoSuchTableError)
 
         return self._convert_glue_to_iceberg(self._get_glue_table(database_name=database_name, table_name=table_name))
 
@@ -570,8 +569,7 @@ class GlueCatalog(MetastoreCatalog):
         Raises:
             NoSuchTableError: If a table with the name does not exist, or the identifier is invalid.
         """
-        identifier_tuple = self._identifier_to_tuple_without_catalog(identifier)
-        database_name, table_name = self.identifier_to_database_and_table(identifier_tuple, NoSuchTableError)
+        database_name, table_name = self.identifier_to_database_and_table(identifier, NoSuchTableError)
         try:
             self.glue.delete_table(DatabaseName=database_name, Name=table_name)
         except self.glue.exceptions.EntityNotFoundException as e:
@@ -596,8 +594,7 @@ class GlueCatalog(MetastoreCatalog):
             NoSuchPropertyException: When from table miss some required properties.
             NoSuchNamespaceError: When the destination namespace doesn't exist.
         """
-        from_identifier_tuple = self._identifier_to_tuple_without_catalog(from_identifier)
-        from_database_name, from_table_name = self.identifier_to_database_and_table(from_identifier_tuple, NoSuchTableError)
+        from_database_name, from_table_name = self.identifier_to_database_and_table(from_identifier, NoSuchTableError)
         to_database_name, to_table_name = self.identifier_to_database_and_table(to_identifier)
         try:
             get_table_response = self.glue.get_table(DatabaseName=from_database_name, Name=from_table_name)
@@ -789,6 +786,9 @@ class GlueCatalog(MetastoreCatalog):
         raise NotImplementedError
 
     def drop_view(self, identifier: Union[str, Identifier]) -> None:
+        raise NotImplementedError
+
+    def view_exists(self, identifier: Union[str, Identifier]) -> bool:
         raise NotImplementedError
 
     @staticmethod

@@ -19,6 +19,8 @@
 import math
 import time
 import uuid
+from datetime import datetime, timedelta
+from pathlib import PosixPath
 from urllib.parse import urlparse
 
 import pyarrow as pa
@@ -833,12 +835,14 @@ def test_table_scan_default_to_large_types(catalog: Catalog) -> None:
 
     result_table = tbl.scan().to_arrow()
 
-    expected_schema = pa.schema([
-        pa.field("string", pa.large_string()),
-        pa.field("string-to-binary", pa.large_binary()),
-        pa.field("binary", pa.large_binary()),
-        pa.field("list", pa.large_list(pa.large_string())),
-    ])
+    expected_schema = pa.schema(
+        [
+            pa.field("string", pa.large_string()),
+            pa.field("string-to-binary", pa.large_binary()),
+            pa.field("binary", pa.large_binary()),
+            pa.field("list", pa.large_list(pa.large_string())),
+        ]
+    )
     assert result_table.schema.equals(expected_schema)
 
 
@@ -874,12 +878,14 @@ def test_table_scan_override_with_small_types(catalog: Catalog) -> None:
     tbl.io.properties[PYARROW_USE_LARGE_TYPES_ON_READ] = "False"
     result_table = tbl.scan().to_arrow()
 
-    expected_schema = pa.schema([
-        pa.field("string", pa.string()),
-        pa.field("string-to-binary", pa.binary()),
-        pa.field("binary", pa.binary()),
-        pa.field("list", pa.list_(pa.string())),
-    ])
+    expected_schema = pa.schema(
+        [
+            pa.field("string", pa.string()),
+            pa.field("string-to-binary", pa.binary()),
+            pa.field("binary", pa.binary()),
+            pa.field("list", pa.list_(pa.string())),
+        ]
+    )
     assert result_table.schema.equals(expected_schema)
 
 
@@ -917,3 +923,58 @@ def test_table_scan_empty_table(catalog: Catalog) -> None:
     result_table = tbl.scan().to_arrow()
 
     assert len(result_table) == 0
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("catalog", [pytest.lazy_fixture("session_catalog_hive"), pytest.lazy_fixture("session_catalog")])
+def test_read_from_s3_and_local_fs(catalog: Catalog, tmp_path: PosixPath) -> None:
+    identifier = "default.test_read_from_s3_and_local_fs"
+    schema = pa.schema([pa.field("colA", pa.string())])
+    arrow_table = pa.Table.from_arrays([pa.array(["one"])], schema=schema)
+
+    tmp_dir = tmp_path / "data"
+    tmp_dir.mkdir()
+    local_file = tmp_dir / "local_file.parquet"
+
+    try:
+        catalog.drop_table(identifier)
+    except NoSuchTableError:
+        pass
+    tbl = catalog.create_table(identifier, schema=schema)
+
+    # Append table to s3 endpoint
+    tbl.append(arrow_table)
+
+    # Append a local file
+    pq.write_table(arrow_table, local_file)
+    tbl.add_files([str(local_file)])
+
+    result_table = tbl.scan().to_arrow()
+    assert result_table["colA"].to_pylist() == ["one", "one"]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("catalog", [pytest.lazy_fixture("session_catalog_hive"), pytest.lazy_fixture("session_catalog")])
+def test_scan_with_datetime(catalog: Catalog) -> None:
+    table = create_table(catalog)
+
+    yesterday = datetime.now() - timedelta(days=1)
+    table.append(
+        pa.Table.from_pylist(
+            [
+                {
+                    "str": "foo",
+                    "int": 1,
+                    "bool": True,
+                    "datetime": yesterday,
+                }
+            ],
+            schema=table.schema().as_arrow(),
+        ),
+    )
+
+    df = table.scan(row_filter=GreaterThanOrEqual("datetime", yesterday)).to_pandas()
+    assert len(df) == 1
+
+    df = table.scan(row_filter=LessThan("datetime", yesterday)).to_pandas()
+    assert len(df) == 0
