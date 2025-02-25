@@ -1300,7 +1300,7 @@ class Table:
         return self.metadata.refs
 
     def _do_commit(self, updates: Tuple[TableUpdate, ...], requirements: Tuple[TableRequirement, ...]) -> None:
-        def _on_error(*_: list) -> None:
+        def _on_error(*_: Any) -> None:
             nonlocal updates, requirements
             self.refresh()
             next_seq_num = self.metadata.next_sequence_number()
