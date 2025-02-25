@@ -1500,7 +1500,7 @@ class ArrowScan:
         self._table_metadata = table_metadata
         self._io = io
         self._projected_schema = projected_schema
-        self._bound_row_filter = bind(table_metadata.schema(), row_filter, case_sensitive=case_sensitive)
+        self._bound_row_filter = row_filter
         self._case_sensitive = case_sensitive
         self._limit = limit
 
