@@ -90,7 +90,7 @@ class UpdateTableMetadata(ABC, Generic[U]):
             retry=retry_if_exception_type(CommitFailedException),
             after=self._cleanup_commit_failure,
         )
-        def commit_inner():
+        def commit_inner() -> None:
             self._transaction._apply(*self._commit())
 
         return commit_inner()

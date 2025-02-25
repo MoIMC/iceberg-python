@@ -43,8 +43,8 @@ from pydantic import Field
 from sortedcontainers import SortedList
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
 
-from pyiceberg.exceptions import CommitFailedException
 import pyiceberg.expressions.parser as parser
+from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.expressions import (
     AlwaysFalse,
     AlwaysTrue,
@@ -1300,7 +1300,7 @@ class Table:
         return self.metadata.refs
 
     def _do_commit(self, updates: Tuple[TableUpdate, ...], requirements: Tuple[TableRequirement, ...]) -> None:
-        def _on_error(*_):
+        def _on_error(*_) -> None:
             nonlocal updates, requirements
             self.refresh()
             next_seq_num = self.metadata.next_sequence_number()
