@@ -41,7 +41,7 @@ from typing import (
 
 from pydantic import Field
 from sortedcontainers import SortedList
-from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
 
 from pyiceberg.exceptions import CommitFailedException
 import pyiceberg.expressions.parser as parser
@@ -62,6 +62,7 @@ from pyiceberg.expressions.visitors import (
     expression_evaluator,
     inclusive_projection,
     manifest_evaluator,
+    rewrite_not,
 )
 from pyiceberg.io import FileIO, load_file_io
 from pyiceberg.manifest import (
@@ -1482,6 +1483,7 @@ class TableScan(ABC):
     snapshot_id: Optional[int]
     options: Properties
     limit: Optional[int]
+    bound_filter: BooleanExpression
 
     def __init__(
         self,
@@ -1502,6 +1504,7 @@ class TableScan(ABC):
         self.snapshot_id = snapshot_id
         self.options = options
         self.limit = limit
+        self.bound_filter = bind(self.table_metadata.schema(), rewrite_not(self.row_filter), self.case_sensitive)
 
     def snapshot(self) -> Optional[Snapshot]:
         if self.snapshot_id:
@@ -1685,8 +1688,7 @@ class DataScan(TableScan):
         # shared instance across multiple threads.
         return lambda data_file: _InclusiveMetricsEvaluator(
             schema,
-            self.row_filter,
-            self.case_sensitive,
+            self.bound_filter,
             include_empty_files,
         ).eval(data_file)
 
@@ -1703,7 +1705,7 @@ class DataScan(TableScan):
         return lambda datafile: (
             residual_evaluator_of(
                 spec=spec,
-                expr=self.row_filter,
+                expr=self.bound_filter,
                 case_sensitive=self.case_sensitive,
                 schema=self.table_metadata.schema(),
             )
@@ -1810,7 +1812,7 @@ class DataScan(TableScan):
         from pyiceberg.io.pyarrow import ArrowScan
 
         return ArrowScan(
-            self.table_metadata, self.io, self.projection(), self.row_filter, self.case_sensitive, self.limit
+            self.table_metadata, self.io, self.projection(), self.bound_filter, self.case_sensitive, self.limit
         ).to_table(self.plan_files())
 
     def to_arrow_batch_reader(self) -> pa.RecordBatchReader:
@@ -1830,7 +1832,7 @@ class DataScan(TableScan):
 
         target_schema = schema_to_pyarrow(self.projection())
         batches = ArrowScan(
-            self.table_metadata, self.io, self.projection(), self.row_filter, self.case_sensitive, self.limit
+            self.table_metadata, self.io, self.projection(), self.bound_filter, self.case_sensitive, self.limit
         ).to_record_batches(self.plan_files())
 
         return pa.RecordBatchReader.from_batches(
@@ -1903,7 +1905,7 @@ class DataScan(TableScan):
                     table_metadata=self.table_metadata,
                     io=self.io,
                     projected_schema=self.projection(),
-                    row_filter=self.row_filter,
+                    row_filter=self.bound_filter,
                     case_sensitive=self.case_sensitive,
                 )
                 tbl = arrow_scan.to_table([task])

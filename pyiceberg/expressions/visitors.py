@@ -1139,12 +1139,10 @@ class _InclusiveMetricsEvaluator(_MetricsEvaluator):
     struct: StructType
     expr: BooleanExpression
 
-    def __init__(
-        self, schema: Schema, expr: BooleanExpression, case_sensitive: bool = True, include_empty_files: bool = False
-    ) -> None:
+    def __init__(self, schema: Schema, expr: BooleanExpression, include_empty_files: bool = False) -> None:
         self.struct = schema.as_struct()
         self.include_empty_files = include_empty_files
-        self.expr = bind(schema, rewrite_not(expr), case_sensitive)
+        self.expr = expr
 
     def eval(self, file: DataFile) -> bool:
         """Test whether the file may contain records that match the expression."""
