@@ -502,37 +502,37 @@ def test_integer_not_eq_rewritten(schema_data_file: Schema, data_file: DataFile)
 
 
 def test_integer_case_insensitive_not_eq_rewritten(schema_data_file: Schema, data_file: DataFile) -> None:
-    should_read = _InclusiveMetricsEvaluator(schema_data_file, Not(EqualTo("ID", INT_MIN_VALUE - 25)), case_sensitive=False).eval(
+    should_read = _InclusiveMetricsEvaluator(schema_data_file, Not(EqualTo("ID", INT_MIN_VALUE - 25))).eval(
         data_file
     )
     assert should_read, "Should read: id below lower bound"
 
-    should_read = _InclusiveMetricsEvaluator(schema_data_file, Not(EqualTo("ID", INT_MIN_VALUE - 1)), case_sensitive=False).eval(
+    should_read = _InclusiveMetricsEvaluator(schema_data_file, Not(EqualTo("ID", INT_MIN_VALUE - 1))).eval(
         data_file
     )
     assert should_read, "Should read: id below lower bound"
 
-    should_read = _InclusiveMetricsEvaluator(schema_data_file, Not(EqualTo("ID", INT_MIN_VALUE)), case_sensitive=False).eval(
+    should_read = _InclusiveMetricsEvaluator(schema_data_file, Not(EqualTo("ID", INT_MIN_VALUE))).eval(
         data_file
     )
     assert should_read, "Should read: id equal to lower bound"
 
-    should_read = _InclusiveMetricsEvaluator(schema_data_file, Not(EqualTo("ID", INT_MAX_VALUE - 4)), case_sensitive=False).eval(
+    should_read = _InclusiveMetricsEvaluator(schema_data_file, Not(EqualTo("ID", INT_MAX_VALUE - 4))).eval(
         data_file
     )
     assert should_read, "Should read: id between lower and upper bounds"
 
-    should_read = _InclusiveMetricsEvaluator(schema_data_file, Not(EqualTo("ID", INT_MAX_VALUE)), case_sensitive=False).eval(
+    should_read = _InclusiveMetricsEvaluator(schema_data_file, Not(EqualTo("ID", INT_MAX_VALUE))).eval(
         data_file
     )
     assert should_read, "Should read: id equal to upper bound"
 
-    should_read = _InclusiveMetricsEvaluator(schema_data_file, Not(EqualTo("ID", INT_MAX_VALUE + 1)), case_sensitive=False).eval(
+    should_read = _InclusiveMetricsEvaluator(schema_data_file, Not(EqualTo("ID", INT_MAX_VALUE + 1))).eval(
         data_file
     )
     assert should_read, "Should read: id above upper bound"
 
-    should_read = _InclusiveMetricsEvaluator(schema_data_file, Not(EqualTo("ID", INT_MAX_VALUE + 6)), case_sensitive=False).eval(
+    should_read = _InclusiveMetricsEvaluator(schema_data_file, Not(EqualTo("ID", INT_MAX_VALUE + 6))).eval(
         data_file
     )
     assert should_read, "Should read: id above upper bound"
@@ -540,7 +540,7 @@ def test_integer_case_insensitive_not_eq_rewritten(schema_data_file: Schema, dat
 
 def test_missing_column_case_sensitive(schema_data_file: Schema, data_file: DataFile) -> None:
     with pytest.raises(ValueError) as exc_info:
-        _ = _InclusiveMetricsEvaluator(schema_data_file, LessThan("ID", 22), case_sensitive=True).eval(data_file)
+        _ = _InclusiveMetricsEvaluator(schema_data_file, LessThan("ID", 22)).eval(data_file)
 
     assert str(exc_info.value) == "Could not find field with name ID, case_sensitive=True"
 
