@@ -38,6 +38,7 @@ from pyiceberg.expressions.visitors import (
     ROWS_MUST_MATCH,
     _InclusiveMetricsEvaluator,
     _StrictMetricsEvaluator,
+    bind,
     inclusive_projection,
     manifest_evaluator,
 )
@@ -385,8 +386,9 @@ class _DeleteFiles(_SnapshotProducer["_DeleteFiles"]):
             )
 
         manifest_evaluators: Dict[int, Callable[[ManifestFile], bool]] = KeyDefaultDict(self._build_manifest_evaluator)
-        strict_metrics_evaluator = _StrictMetricsEvaluator(schema, self._predicate, case_sensitive=self._case_sensitive).eval
-        inclusive_metrics_evaluator = _InclusiveMetricsEvaluator(schema, self._predicate).eval
+        bound_predicate = bind(self._transaction.table_metadata.schema(), self._predicate, case_sensitive=self._case_sensitive)
+        strict_metrics_evaluator = _StrictMetricsEvaluator(schema, bound_predicate, case_sensitive=self._case_sensitive).eval
+        inclusive_metrics_evaluator = _InclusiveMetricsEvaluator(schema, bound_predicate).eval
 
         existing_manifests = []
         total_deleted_entries = []
