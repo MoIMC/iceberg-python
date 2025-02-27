@@ -386,9 +386,10 @@ class _DeleteFiles(_SnapshotProducer["_DeleteFiles"]):
             )
 
         manifest_evaluators: Dict[int, Callable[[ManifestFile], bool]] = KeyDefaultDict(self._build_manifest_evaluator)
-        bound_predicate = bind(self._transaction.table_metadata.schema(), self._predicate, case_sensitive=self._case_sensitive)
-        strict_metrics_evaluator = _StrictMetricsEvaluator(schema, bound_predicate, case_sensitive=self._case_sensitive).eval
-        inclusive_metrics_evaluator = _InclusiveMetricsEvaluator(schema, bound_predicate).eval
+        strict_metrics_evaluator = _StrictMetricsEvaluator(schema, self._predicate, case_sensitive=self._case_sensitive).eval
+        inclusive_metrics_evaluator = _InclusiveMetricsEvaluator(
+            schema, bind(self._transaction.table_metadata.schema(), self._predicate, case_sensitive=self._case_sensitive)
+        ).eval
 
         existing_manifests = []
         total_deleted_entries = []
