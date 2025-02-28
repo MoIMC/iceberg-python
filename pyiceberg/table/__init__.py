@@ -41,7 +41,7 @@ from typing import (
 
 from pydantic import Field
 from sortedcontainers import SortedList
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
+from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
 
 import pyiceberg.expressions.parser as parser
 from pyiceberg.exceptions import CommitFailedException
@@ -1300,7 +1300,7 @@ class Table:
         return self.metadata.refs
 
     def _do_commit(self, updates: Tuple[TableUpdate, ...], requirements: Tuple[TableRequirement, ...]) -> None:
-        def _on_error(*_: Any) -> None:
+        def _on_error(*_: RetryCallState) -> None:
             nonlocal updates, requirements
             self.refresh()
             next_seq_num = self.metadata.next_sequence_number()
@@ -1662,6 +1662,7 @@ class DataScan(TableScan):
         return lambda data_file: _InclusiveMetricsEvaluator(
             schema,
             self.bound_filter,
+            self.case_sensitive,
             include_empty_files,
         ).eval(data_file)
 
