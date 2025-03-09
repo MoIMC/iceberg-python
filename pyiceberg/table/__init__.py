@@ -1468,6 +1468,7 @@ class TableScan(ABC):
         snapshot_id: Optional[int] = None,
         options: Properties = EMPTY_DICT,
         limit: Optional[int] = None,
+        bound_filter: Optional[BooleanExpression] = None
     ):
         self.table_metadata = table_metadata
         self.io = io
@@ -1477,7 +1478,7 @@ class TableScan(ABC):
         self.snapshot_id = snapshot_id
         self.options = options
         self.limit = limit
-        self.bound_filter = bind(self.table_metadata.schema(), rewrite_not(self.row_filter), self.case_sensitive)
+        self.bound_filter = bound_filter or bind(self.table_metadata.schema(), rewrite_not(self.row_filter), self.case_sensitive)
 
     def snapshot(self) -> Optional[Snapshot]:
         if self.snapshot_id:
